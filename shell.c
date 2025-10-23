@@ -8,7 +8,16 @@
 #include <ctype.h>      /* pour avoir isspace & co. */
 #include <string.h>
 #include <errno.h>      /* pour avoir errno */
+#define MAXELEMS 40
+char* elems[MAXELEMS];
+typedef enum {
+    SEP_NONE,
+    SEP_SEMICOLON,
+    SEP_AND,
+    SEP_OR
+} Separator;
 
+Separator separators[MAXELEMS];
 
 
 //Afficher le prompt → getcwd() + printf() + fflush().
@@ -34,23 +43,72 @@ Gérer les erreurs → errno + strerror().
 
 char ligne[4096];       /* contient la commande que je viens de taper */
 
-
 void affiche_invite()
 {
   char cwd[1024];
   getcwd(cwd,sizeof(cwd)); // recuperer le chemin dont je suis en ce moment 
-  printf("%s~", cwd);
+  printf("%s\n~", cwd);
   fflush(stdout);
 }
 
 void lit_ligne()
 {
-  if (!fgets(ligne,sizeof(ligne)-1,stdin)) { // lire la commande taer par l'utilisateur et la stocker dans ligne 
+  if (!fgets(ligne,sizeof(ligne)-1,stdin)) { // lire la commande taper par l'utilisateur et la stocker dans ligne 
     /* ^D ou fin de fichier => on quittte */
     printf("\n");
     exit(0);
   }
+  ligne[strcspn(ligne, "\n")] = '\0';
 }
+
+
+
+void decoupe() {
+    char *debut = ligne;
+    int i = 0;
+
+    while (*debut && i < MAXELEMS - 1) {
+        // sauter les espaces au début
+        while (*debut && isspace(*debut)) debut++;
+
+        if (!*debut) break;
+
+        // mémoriser le début de la commande
+        elems[i] = debut;
+
+        // chercher le prochain séparateur
+        separators[i] = SEP_NONE; // par défaut
+        while (*debut) {
+            if (*debut == ';') {
+                separators[i] = SEP_SEMICOLON;
+                *debut = '\0';
+                debut++;
+                break;
+            } else if (*debut == '&' && *(debut+1) == '&') {
+                separators[i] = SEP_AND;
+                *debut = '\0';
+                debut += 2;
+                break;
+            } else if (*debut == '|' && *(debut+1) == '|') {
+                separators[i] = SEP_OR;
+                *debut = '\0';
+                debut += 2;
+                break;
+            }
+            debut++;
+        }
+
+        // enlever les espaces de fin
+        char *fin = elems[i] + strlen(elems[i]) - 1;
+        while (fin > elems[i] && isspace(*fin)) *fin-- = '\0';
+
+        i++;
+    }
+
+    elems[i] = NULL;
+}
+
+
 
 /* attent la fin du processus pid  c'est le parent qui le shel qui execute cette fonction */
 void attent(pid_t pid)
@@ -73,38 +131,62 @@ void attent(pid_t pid)
 }
 
 /* execute la ligne */
-void execute()
-{
-  pid_t pid;
 
-  /* supprime le \n final */
-  if (strchr(ligne,'\n')) *strchr(ligne,'\n') = 0;
+void execute() {
+    pid_t pid;
+    int i = 0;
+    int last_status = 0; // statut de la commande précédente
 
-  /* saute les lignes vides */
-  if (!strcmp(ligne,"")) return;
+    while (elems[i] != NULL) {
+        // Vérifier condition pour && et ||
+        if (i > 0) {
+            if (separators[i-1] == SEP_AND && last_status != 0) {
+                i++;
+                continue; // && : exécuter seulement si la précédente a réussi
+            }
+            if (separators[i-1] == SEP_OR && last_status == 0) {
+                i++;
+                continue; // || : exécuter seulement si la précédente a échoué
+            }
+        }
 
-  pid = fork(); // creation dun processus fils qui va executer la commande taper par l'utilisateur 
-  if (pid < 0) {
-    printf("fork a Ã©chouÃ© (%s)\n",strerror(errno));
-    return;
-  }
+        // découper en arguments
+        char *args[MAXELEMS];
+        char *token = strtok(elems[i], " \t");
+        int j = 0;
+        while (token && j < MAXELEMS - 1) {
+            args[j++] = token;
+            token = strtok(NULL, " \t");
+        }
+        args[j] = NULL;
 
-  if (pid==0) { 
-    /* fils */
-    execlp(ligne, /* programme Ã  exÃ©cuter */
-	   ligne, /* argv[0], par convention le nom de programme exÃ©cutÃ© */
-	   NULL   /* pas d'autre argument */
-	   );
+        // fork pour exécuter la commande
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            return;
+        }
 
-    /* on n'arrive ici que si le exec a Ã©chouÃ© */
-    printf("impossible d'Ã©xecuter \"%s\" (%s)\n",ligne,strerror(errno));
-    exit(1);
-  }
-  else {
-    /* père */
-    attent(pid);
-  }
+        if (pid == 0) {
+            execvp(args[0], args);
+            perror(args[0]);
+            exit(1);
+        } else {
+            int status;
+            waitpid(pid, &status, 0);
+            if (WIFEXITED(status))
+                last_status = WEXITSTATUS(status);
+            else
+                last_status = 1; // si fin par signal => considérer comme échec
+        }
+
+        i++;
+    }
 }
+
+        
+
+   
 
 int main()
 {
@@ -112,6 +194,7 @@ int main()
   while (1) {
     affiche_invite();
     lit_ligne();
+    decoupe();
     execute();
   }
   return 0;
